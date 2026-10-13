@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Draw under the camera cutout so the canvas uses the whole screen. -->
+    <style name="Theme.LightCraft" parent="Theme.LightCraft.Base">
+        <item name="android:windowLayoutInDisplayCutoutMode">shortEdges</item>
+    </style>
+</resources>

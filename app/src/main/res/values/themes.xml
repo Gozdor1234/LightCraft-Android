@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="lc_background">#FF1C1C1C</color>
+    <color name="lc_icon_bg">#FF16181D</color>
+
+    <style name="Theme.LightCraft.Base" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/lc_background</item>
+        <item name="android:colorBackground">@color/lc_background</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowFullscreen">true</item>
+    </style>
+
+    <style name="Theme.LightCraft" parent="Theme.LightCraft.Base" />
+</resources>

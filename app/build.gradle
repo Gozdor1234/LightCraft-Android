@@ -1,0 +1,62 @@
+plugins {
+    id "com.android.application"
+}
+
+// Versioning: CI passes the run number so every build installs as an update over the last one.
+def ciBuild = (System.getenv("GITHUB_RUN_NUMBER") ?: "1").toInteger()
+def lightcraftVersion = System.getenv("LIGHTCRAFT_VERSION") ?: "dev"
+
+android {
+    namespace "com.gozdor.lightcraft"
+    compileSdk 35
+
+    defaultConfig {
+        applicationId "com.gozdor.lightcraft"
+        // WebView updates through the Play Store, so the WebAssembly/OPFS features LightCraft
+        // needs come from the installed WebView version, not the Android version.
+        minSdk 26
+        targetSdk 35
+        versionCode ciBuild
+        versionName "${lightcraftVersion}-android.${ciBuild}"
+    }
+
+    // A fixed key so each new build installs as an update and keeps the photo library.
+    // CI decrypts signing/lightcraft-release.jks.enc with the LC_SIGNING_PASSPHRASE secret and
+    // passes the result here; the plaintext key is never committed. See README.md.
+    def keystorePath = System.getenv("LC_KEYSTORE_FILE")
+    def keystorePassword = System.getenv("LC_SIGNING_PASSPHRASE")
+    def canSign = keystorePath && keystorePassword && file(keystorePath).exists()
+
+    signingConfigs {
+        if (canSign) {
+            release {
+                storeFile file(keystorePath)
+                storePassword keystorePassword
+                keyAlias "lightcraft"
+                keyPassword keystorePassword
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            if (canSign) signingConfig signingConfigs.release
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    androidResources {
+        // Store the WebAssembly module uncompressed: faster to stream at startup.
+        noCompress += ["wasm"]
+    }
+
+    lint {
+        abortOnError false
+        checkReleaseBuilds false
+    }
+}

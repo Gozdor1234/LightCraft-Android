@@ -1,0 +1,165 @@
+name: Build APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      lightcraft_ref:
+        description: "LightCraft commit, tag or branch to build (blank = the pinned commit below)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write # to publish the APK as a release
+
+concurrency:
+  group: build-apk
+  cancel-in-progress: false
+
+env:
+  # Pinned so every build is reproducible; bump deliberately to pick up LightCraft changes.
+  LIGHTCRAFT_REPO: storytold/lightcraft
+  LIGHTCRAFT_PINNED_REF: 701f78ea2e586d4748705f10fdf5c4181dc1fd49
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Check out this wrapper
+        uses: actions/checkout@v4
+
+      - name: Check the signing secret is set (fail fast)
+        env:
+          LC_SIGNING_PASSPHRASE: ${{ secrets.LC_SIGNING_PASSPHRASE }}
+        run: |
+          if [ -z "$LC_SIGNING_PASSPHRASE" ]; then
+            echo "::error::Add the LC_SIGNING_PASSPHRASE secret (Settings > Secrets and variables > Actions) and re-run."
+            exit 1
+          fi
+
+      - name: Check out LightCraft
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.LIGHTCRAFT_REPO }}
+          ref: ${{ inputs.lightcraft_ref || env.LIGHTCRAFT_PINNED_REF }}
+          path: lightcraft-src
+
+      - name: Record LightCraft version
+        id: lc
+        run: |
+          ver=$(sed -n '/^\[workspace.package\]/,/^\[/{s/^version = "\(.*\)"/\1/p}' lightcraft-src/Cargo.toml | head -1)
+          sha=$(git -C lightcraft-src rev-parse --short=12 HEAD)
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "LightCraft $ver at $sha"
+
+      - name: Install Rust (stable + wasm32 target)
+        run: |
+          rustup toolchain install stable --profile minimal --target wasm32-unknown-unknown
+          rustup default stable
+          rustc --version
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: lightcraft-src
+          shared-key: lightcraft-web
+
+      - name: Find the wasm-bindgen version LightCraft pins
+        id: wb
+        run: |
+          v=$(awk '$0=="name = \"wasm-bindgen\""{getline; gsub(/version = |"/,""); print; exit}' lightcraft-src/Cargo.lock)
+          test -n "$v"
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "wasm-bindgen $v"
+
+      - name: Install matching wasm-bindgen CLI
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen@${{ steps.wb.outputs.version }}
+
+      - name: Build LightCraft for the web (WASM)
+        working-directory: lightcraft-src
+        run: cargo xtask web
+
+      - name: Bundle the web build into the app
+        run: |
+          site="$(cargo metadata --manifest-path lightcraft-src/Cargo.toml --format-version 1 --no-deps | jq -r .target_directory)/web-site"
+          www=app/src/main/assets/www
+          rm -rf "$www"; mkdir -p "$www/licenses"
+          for f in index.html worker.js lightcraft_web.js lightcraft_web_bg.wasm; do
+            cp "$site/$f" "$www/$f"
+          done
+          # LightCraft's license terms travel with every copy (MIT/Apache-2.0 + third-party notices)
+          cp lightcraft-src/LICENSE-MIT lightcraft-src/LICENSE-APACHE lightcraft-src/NOTICE "$www/licenses/"
+          cp lightcraft-src/assets/ATTRIBUTION.md "$www/licenses/" 2>/dev/null || true
+          cp lightcraft-src/assets/fonts/OFL-*.txt "$www/licenses/" 2>/dev/null || true
+          printf 'LightCraft %s (%s) from https://github.com/%s\n' \
+            "${{ steps.lc.outputs.version }}" "${{ steps.lc.outputs.sha }}" "$LIGHTCRAFT_REPO" > "$www/licenses/SOURCE.txt"
+          ls -la "$www" "$www/licenses"
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Decrypt signing key
+        env:
+          LC_SIGNING_PASSPHRASE: ${{ secrets.LC_SIGNING_PASSPHRASE }}
+        run: |
+          if [ -z "$LC_SIGNING_PASSPHRASE" ]; then
+            echo "::error::Add the LC_SIGNING_PASSPHRASE secret (Settings > Secrets and variables > Actions) and re-run."
+            exit 1
+          fi
+          key="$RUNNER_TEMP/lightcraft-release.jks"
+          printf '%s' "$LC_SIGNING_PASSPHRASE" > "$RUNNER_TEMP/pp"
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 600000 \
+            -in signing/lightcraft-release.jks.enc -out "$key" -pass "file:$RUNNER_TEMP/pp"
+          rm -f "$RUNNER_TEMP/pp"
+          echo "LC_KEYSTORE_FILE=$key" >> "$GITHUB_ENV"
+
+      - name: Build signed APK
+        env:
+          LIGHTCRAFT_VERSION: ${{ steps.lc.outputs.version }}
+          LC_SIGNING_PASSPHRASE: ${{ secrets.LC_SIGNING_PASSPHRASE }}
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon assembleRelease
+          rm -f "$LC_KEYSTORE_FILE"
+
+      - name: Verify APK
+        id: apk
+        run: |
+          bt=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          src=app/build/outputs/apk/release/app-release.apk
+          out="LightCraft-${{ steps.lc.outputs.version }}-android.${{ github.run_number }}.apk"
+          cp "$src" "$out"
+          "$bt/apksigner" verify --verbose --print-certs "$out"
+          "$bt/aapt2" dump badging "$out" | grep -E "^(package|sdkVersion|targetSdkVersion|application-label|launchable-activity)"
+          unzip -l "$out" | grep -E "assets/www/"
+          ls -lh "$out"
+          echo "file=$out" >> "$GITHUB_OUTPUT"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.apk.outputs.file }}
+          path: ${{ steps.apk.outputs.file }}
+          if-no-files-found: error
+
+      - name: Publish release (download from your phone)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: LightCraft ${{ steps.lc.outputs.version }} for Android (build ${{ github.run_number }})
+          body: |
+            LightCraft ${{ steps.lc.outputs.version }} (storytold/lightcraft @ ${{ steps.lc.outputs.sha }}), wrapped for Android.
+            Install the APK below. Builds are signed with the same key, so each one installs as an update and keeps your library.
+          files: ${{ steps.apk.outputs.file }}
+          make_latest: "true"
